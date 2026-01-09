@@ -45,7 +45,7 @@ enum class SensorMode : char {
 
 class DigipasDWL : public asynPortDriver {
   public:
-    DigipasDWL(const char* conn_port, const char* driver_port);
+    DigipasDWL(const char* conn_port, const char* driver_port, std::string mode, int country, int city);
     virtual void poll(void);
     virtual asynStatus writeInt32(asynUser* pasynUser, epicsInt32 value);
     virtual asynStatus writeFloat64(asynUser* pasynUser, epicsFloat64 value);

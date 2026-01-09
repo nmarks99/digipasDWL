@@ -4,7 +4,7 @@
 #include <epicsExport.h>
 #include <epicsThread.h>
 #include <iocsh.h>
-#include <iostream>
+#include <algorithm>
 
 static void poll_thread_C(void* pPvt) {
     DigipasDWL* pDigipasDWL = (DigipasDWL*)pPvt;
@@ -12,14 +12,12 @@ static void poll_thread_C(void* pPvt) {
 }
 
 constexpr int MAX_CONTROLLERS = 1;
+constexpr int INTERFACE_MASK = asynInt32Mask | asynFloat64Mask | asynOctetMask | asynDrvUserMask;
+constexpr int INTERRUPT_MASK = asynInt32Mask | asynFloat64Mask | asynOctetMask;
+constexpr int ASYN_FLAGS = ASYN_MULTIDEVICE | ASYN_CANBLOCK;
 
-DigipasDWL::DigipasDWL(const char* conn_port, const char* driver_port)
-    : asynPortDriver(driver_port, MAX_CONTROLLERS,
-                     asynInt32Mask | asynFloat64Mask | asynDrvUserMask | asynOctetMask | asynInt32ArrayMask,
-                     asynInt32Mask | asynFloat64Mask | asynOctetMask | asynInt32ArrayMask,
-                     ASYN_MULTIDEVICE | ASYN_CANBLOCK,
-                     1, /* ASYN_CANBLOCK=0, ASYN_MULTIDEVICE=1, autoConnect=1 */
-                     0, 0) {
+DigipasDWL::DigipasDWL(const char* conn_port, const char* driver_port, std::string mode_str, int country, int city)
+    : asynPortDriver(driver_port, MAX_CONTROLLERS, INTERFACE_MASK, INTERRUPT_MASK, ASYN_FLAGS, 1, 0, 0) {
 
     asynStatus status = pasynOctetSyncIO->connect(conn_port, 0, &pasynUserDriver_, NULL);
     if (status) {
@@ -30,19 +28,32 @@ DigipasDWL::DigipasDWL(const char* conn_port, const char* driver_port)
     createParam(X_DEG_STRING, asynParamFloat64, &xdegId_);
     createParam(Y_DEG_STRING, asynParamFloat64, &ydegId_);
 
-    std::cout << "initializing sensor..." << std::endl;
     status = init_sensor();
-    if (status) return;
+    if (status)
+        return;
 
-    std::cout << "Setting location..." << std::endl;
-    status = set_location(0x42, 0x05); // United States, Chicago
-    if (status) return;
+    status = set_location(country, city);
+    if (status)
+        return;
 
-    std::cout << "Setting sensor to Dual Mode..." << std::endl;
-    status = set_mode(SensorMode::Dual);
-    if (status) return;
+    std::transform(mode_str.begin(), mode_str.end(), mode_str.begin(), [](auto& c){
+	return std::tolower(c);
+    });
 
-    std::cout << "Starting polling loop..." << std::endl;
+    SensorMode sensor_mode = SensorMode::None;
+    if (mode_str == "single") {
+	sensor_mode = SensorMode::Single;
+    } else if (mode_str == "dual") {
+	sensor_mode = SensorMode::Dual;
+    } else if (mode_str == "calibration") {
+        asynPrint(pasynUserDriver_, ASYN_TRACE_ERROR, "Calibration mode not supported\n");
+        return;
+    }
+
+    status = set_mode(sensor_mode);
+    if (status)
+        return;
+
     epicsThreadCreate("DigipasDWLPoller", epicsThreadPriorityLow,
                       epicsThreadGetStackSize(epicsThreadStackMedium), (EPICSTHREADFUNC)poll_thread_C, this);
 }
@@ -51,11 +62,7 @@ void DigipasDWL::poll() {
     while (true) {
         lock();
 
-        // // do stuff ...
-        // std::cout << "Running... " << count_ << std::endl;
-        // count_ += 1;
-
-	get_angles();
+        get_angles();
 
         callParamCallbacks();
         unlock();
@@ -71,7 +78,6 @@ asynStatus DigipasDWL::init_sensor() {
 }
 
 asynStatus DigipasDWL::set_location(char country, char city) {
-    // 0x06, 0x01, 0x08, country, city, 0x00, 0x00, 0x5A, 0x00, 0x00, 0x00, 0x00
     out_buffer_.fill(0x0);
     out_buffer_[0] = 0x06;
     out_buffer_[1] = 0x01;
@@ -94,17 +100,14 @@ double compute_y(const std::array<char, BUFFER_SIZE>& data) {
 
 asynStatus DigipasDWL::get_angles() {
     asynStatus status = read();
-    if (status) return status;
+    if (status)
+        return status;
 
     double x_deg = compute_x(in_buffer_);
     double y_deg = compute_y(in_buffer_);
 
     setDoubleParam(xdegId_, x_deg);
     setDoubleParam(ydegId_, y_deg);
-
-    callParamCallbacks();
-
-    asynPrint(pasynUserDriver_, ASYN_TRACE_ERROR, "{x: %lf, y: %lf} deg\n", x_deg, y_deg);
 
     return status;
 }
@@ -117,7 +120,8 @@ asynStatus DigipasDWL::set_mode(SensorMode mode) {
     out_buffer_[3] = 0xAA;
 
     asynStatus status = write_read();
-    if (status) return status;
+    if (status)
+        return status;
 
     return status;
 
@@ -127,11 +131,11 @@ asynStatus DigipasDWL::set_mode(SensorMode mode) {
 asynStatus DigipasDWL::read() {
     size_t nbytesin;
     int eom_reason;
-    asynStatus status = pasynOctetSyncIO->read(pasynUserDriver_, in_buffer_.data(), in_buffer_.size(), IO_TIMEOUT, &nbytesin, &eom_reason);
+    asynStatus status = pasynOctetSyncIO->read(pasynUserDriver_, in_buffer_.data(), in_buffer_.size(),
+                                               IO_TIMEOUT, &nbytesin, &eom_reason);
     if (status) {
-	asynPrint(pasynUserDriver_, ASYN_TRACE_ERROR,
-		"pasynOctetSyncIO->read() failed[%d]. Read %ld bytes\n",
-		eom_reason, nbytesin);
+        asynPrint(pasynUserDriver_, ASYN_TRACE_ERROR, "pasynOctetSyncIO->read() failed[%d]. Read %ld bytes\n",
+                  eom_reason, nbytesin);
     }
     return status;
 }
@@ -141,11 +145,12 @@ asynStatus DigipasDWL::write_read() {
     size_t nbytesout;
     int eom_reason;
     asynStatus status = pasynOctetSyncIO->writeRead(pasynUserDriver_, out_buffer_.data(), out_buffer_.size(),
-	    in_buffer_.data(), in_buffer_.size(), IO_TIMEOUT, &nbytesout, &nbytesin, &eom_reason);
+                                                    in_buffer_.data(), in_buffer_.size(), IO_TIMEOUT,
+                                                    &nbytesout, &nbytesin, &eom_reason);
     if (status) {
-	asynPrint(pasynUserDriver_, ASYN_TRACE_ERROR,
-		"pasynOctetSyncIO->writeRead() failed[%d]. Wrote %ld, read %ld bytes\n",
-		eom_reason, nbytesout, nbytesin);
+        asynPrint(pasynUserDriver_, ASYN_TRACE_ERROR,
+                  "pasynOctetSyncIO->writeRead() failed[%d]. Wrote %ld, read %ld bytes\n", eom_reason,
+                  nbytesout, nbytesin);
     }
     return status;
 }
@@ -167,18 +172,24 @@ asynStatus DigipasDWL::writeFloat64(asynUser* pasynUser, epicsFloat64 value) {
 }
 
 // register function for iocsh
-extern "C" int DigipasDWLConfig(const char* conn_port, const char* driver_port) {
-    DigipasDWL* pDigipasDWL = new DigipasDWL(conn_port, driver_port);
+extern "C" int DigipasDWLConfig(const char* conn_port, const char* driver_port, const char* mode, int country, int city) {
+    DigipasDWL* pDigipasDWL = new DigipasDWL(conn_port, driver_port, mode, country, city);
     pDigipasDWL = NULL;
     return (asynSuccess);
 }
 
 static const iocshArg DigipasDWLArg0 = {"Connection asyn port", iocshArgString};
 static const iocshArg DigipasDWLArg1 = {"Driver asyn port", iocshArgString};
-static const iocshArg* const DigipasDWLArgs[2] = {&DigipasDWLArg0, &DigipasDWLArg1};
-static const iocshFuncDef DigipasDWLFuncDef = {"DigipasDWLConfig", 2, DigipasDWLArgs};
+static const iocshArg DigipasDWLArg2 = {"Mode", iocshArgString};
+static const iocshArg DigipasDWLArg3 = {"Country code", iocshArgInt};
+static const iocshArg DigipasDWLArg4 = {"City code", iocshArgInt};
+static const iocshArg* const DigipasDWLArgs[5] = {&DigipasDWLArg0, &DigipasDWLArg1, &DigipasDWLArg2,
+                                                  &DigipasDWLArg3, &DigipasDWLArg4};
+static const iocshFuncDef DigipasDWLFuncDef = {"DigipasDWLConfig", 4, DigipasDWLArgs};
 
-static void DigipasDWLCallFunc(const iocshArgBuf* args) { DigipasDWLConfig(args[0].sval, args[1].sval); }
+static void DigipasDWLCallFunc(const iocshArgBuf* args) {
+    DigipasDWLConfig(args[0].sval, args[1].sval, args[2].sval, args[3].ival, args[4].ival);
+}
 
 void DigipasDWLRegister(void) { iocshRegister(&DigipasDWLFuncDef, DigipasDWLCallFunc); }
 
